@@ -118,19 +118,21 @@ struct SSUseSummary {
   const char *Reason;
 
   struct SSCallSummary {
-    Function *F;
+    GlobalValue *GV; // Optional. May be a Function or a GlobalAlias
     FunctionID Callee;
     unsigned ParamNo;
     ConstantRange Range;
-    SSCallSummary(Function *F, unsigned ParamNo)
-        : F(F), Callee(F->getGUID()), ParamNo(ParamNo), Range(64, false) {}
-    SSCallSummary(Function *F, unsigned ParamNo, ConstantRange Range)
-        : F(F), Callee(F->getGUID()), ParamNo(ParamNo), Range(Range) {}
+    SSCallSummary(GlobalValue *GV, unsigned ParamNo)
+        : GV(GV), Callee(GV->getGUID()), ParamNo(ParamNo), Range(64, false) {}
+    SSCallSummary(GlobalValue *GV, unsigned ParamNo, ConstantRange Range)
+        : GV(GV), Callee(GV->getGUID()), ParamNo(ParamNo), Range(Range) {}
+    SSCallSummary(FunctionID Callee, unsigned ParamNo)
+        : GV(nullptr), Callee(Callee), ParamNo(ParamNo), Range(64, false) {}
     SSCallSummary(FunctionID Callee, unsigned ParamNo, ConstantRange Range)
-        : F(nullptr), Callee(Callee), ParamNo(ParamNo), Range(Range) {}
+        : GV(nullptr), Callee(Callee), ParamNo(ParamNo), Range(Range) {}
     std::string name() {
-      if (F)
-        return "@" + F->getName().str();
+      if (GV)
+        return "@" + GV->getName().str();
       return "#" + utostr(Callee);
     }
   };
@@ -183,25 +185,30 @@ struct SSFunctionSummary {
   SSFunctionSummary() = default;
   // Constructor that converts from a FunctionSummary
   SSFunctionSummary(FunctionSummary &FS);
+  // Constructors that create a 'function' summary that forwards all the
+  // parameters to the aliasee.
+  SSFunctionSummary(GlobalAlias &A);
+  SSFunctionSummary(AliasSummary &AS);
 
-  Function *F;         // Optional
-  FunctionSummary *FS; // Optional
+  GlobalValue *GV;         // Optional. May be a Function or a GlobalAlias
+  GlobalValueSummary *GVS; // Optional. May be a Function or an Alias summary
   SmallVector<SSAllocaSummary, 4> Allocas;
   SmallVector<SSParamSummary, 4> Params;
   unsigned DSOLocal : 1;
   unsigned Interposable : 1;
 
   std::string name(FunctionID ID) {
-    if (F)
-      return "@" + F->getName().str();
+    if (GV)
+      return "@" + GV->getName().str();
 
     std::string result = "#" + utostr(ID);
-    if (FS)
-      result += ("[" + FS->modulePath() + "]").str();
+    if (GVS)
+      result += ("[" + GVS->modulePath() + "]").str();
     return result;
   }
   void dump(FunctionID ID) {
-    dbgs() << "  " << name(ID) << "\n";
+    dbgs() << "  " << name(ID) << (DSOLocal ? "" : " dso_preemptable")
+           << (Interposable ? " interposable" : "") << "\n";
     for (unsigned i = 0; i < Params.size(); ++i)
       Params[i].dump(i);
     for (auto &AS : Allocas)
@@ -210,10 +217,10 @@ struct SSFunctionSummary {
 };
 
 SSFunctionSummary::SSFunctionSummary(FunctionSummary &FS) {
-  this->F = nullptr;
-  this->FS = &FS;
+  this->GV = nullptr;
+  this->GVS = &FS;
   this->DSOLocal = FS.isDSOLocal();
-  // Non-prevailing functions are not marked live.
+  // Non-prevailing definitions are not marked live.
   this->Interposable = !FS.isLive();
   for (auto &AS : FS.allocas()) {
     this->Allocas.emplace_back(nullptr, AS.Size);
@@ -228,6 +235,43 @@ SSFunctionSummary::SSFunctionSummary(FunctionSummary &FS) {
     US.Range = US.LocalRange = PS.Range;
     for (auto &Call : PS.CallUses)
       US.Calls.emplace_back(Call.Callee, Call.ParamNo, Call.Range);
+  }
+}
+
+SSFunctionSummary::SSFunctionSummary(GlobalAlias &A) {
+  // This alias may point to another alias, we want to make sure to avoid
+  // skipping intermediate aliases in case they are dso_preemptable
+  GlobalValue *Aliasee = cast<GlobalValue>(
+      A.getAliasee()->stripPointerCastsNoFollowAliases());
+  FunctionType *FnType = cast<FunctionType>(Aliasee->getValueType());
+
+  this->GV = &A;
+  this->GVS = nullptr;
+  this->DSOLocal = A.isDSOLocal();
+  this->Interposable = A.isInterposable();
+
+  // 'Forward' all parameters to this alias to the aliasee
+  for (unsigned ArgNo = 0; ArgNo < FnType->getNumParams(); ArgNo++) {
+    this->Params.emplace_back();
+    SSUseSummary &US = this->Params.back().Summary;
+    US.Calls.emplace_back(Aliasee, ArgNo, ConstantRange(APInt(64, 0)));
+  }
+}
+
+SSFunctionSummary::SSFunctionSummary(AliasSummary &AS) {
+  assert(isa<FunctionSummary>(AS.getAliasee()));
+
+  this->GV = nullptr;
+  this->GVS = &AS;
+  this->DSOLocal = AS.isDSOLocal();
+  // Non-prevailing definitions are not marked live.
+  this->Interposable = !AS.isLive();
+
+  FunctionSummary &DestFn = cast<FunctionSummary>(AS.getAliasee());
+  for (unsigned ArgNo = 0; ArgNo < DestFn.params().size(); ArgNo++) {
+    this->Params.emplace_back();
+    SSUseSummary &US = this->Params.back().Summary;
+    US.Calls.emplace_back(AS.getAliaseeGUID(), ArgNo, ConstantRange(APInt(64, 0)));
   }
 }
 
@@ -461,8 +505,10 @@ bool StackSafetyLocalAnalysis::analyzeAllUses(Value *Ptr, SSUseSummary &US) {
         }
 
         // FIXME: consult devirt?
-        const Function *Callee =
-            dyn_cast<Function>(CS.getCalledValue()->stripPointerCasts());
+        // Do not follow aliases, otherwise we could inadvertently follow
+        // dso_preemptable aliases or aliases with interposable linkage.
+        const GlobalValue *Callee = dyn_cast<GlobalValue>(
+            CS.getCalledValue()->stripPointerCastsNoFollowAliases());
         if (!Callee) {
           US.BadI = I;
           US.Reason = "indirect call";
@@ -470,12 +516,14 @@ bool StackSafetyLocalAnalysis::analyzeAllUses(Value *Ptr, SSUseSummary &US) {
           return false;
         }
 
+        assert(isa<Function>(Callee) || isa<GlobalAlias>(Callee));
+
         ImmutableCallSite::arg_iterator B = CS.arg_begin(), E = CS.arg_end();
         for (ImmutableCallSite::arg_iterator A = B; A != E; ++A) {
           if (A->get() == V) {
             ConstantRange OffsetRange = OffsetFromAlloca(UI, Ptr);
             US.Calls.push_back(SSUseSummary::SSCallSummary(
-                const_cast<Function*>(Callee), A - B, OffsetRange));
+                const_cast<GlobalValue*>(Callee), A - B, OffsetRange));
           }
         }
         // Don't visit function return value: if it depends on the alloca, then
@@ -501,7 +549,7 @@ bool StackSafetyLocalAnalysis::run(SSFunctionSummary &FS) {
          "Can't run StackSafety on a function declaration");
 
   LLVM_DEBUG(dbgs() << "[StackSafety] " << F.getName() << "\n");
-  FS.F = &F;
+  FS.GV = &F;
   FS.DSOLocal = F.isDSOLocal();
   FS.Interposable = F.isInterposable();
 
@@ -884,6 +932,8 @@ bool StackSafetyGlobalAnalysis::runOnModule(Module &M) {
     for (auto &F : M.functions())
       if (!F.isDeclaration())
         Functions[F.getGUID()] = std::move(SSI.run(F).Summary);
+    for (auto &A : M.aliases())
+      Functions[A.getGUID()] = llvm::make_unique<SSFunctionSummary>(A);
 
     StackSafetyDataFlowAnalysis SSDFA(Functions);
     SSDFA.run();
@@ -928,6 +978,9 @@ bool StackSafetyGlobalAnalysis::runOnModule(Module &M) {
             break;
         }
       }
+
+      assert(GVS->isLive() &&
+             "Promoted/internalized/imported function must be live");
     }
 
     assert(GVS && "GlobalValueSummary for function not found");
@@ -935,7 +988,7 @@ bool StackSafetyGlobalAnalysis::runOnModule(Module &M) {
 
     FunctionSummary *FS = dyn_cast<FunctionSummary>(GVS);
     auto Summary = llvm::make_unique<SSFunctionSummary>(*FS);
-    Summary->F = &F;
+    Summary->GV = &F;
 
     // Set the SSAllocaSummary AllocaInst pointers if the function is alive
     // (allocas for dead functions are dropped in stackSafetyGlobalAnalysis)
@@ -968,12 +1021,17 @@ void stackSafetyGlobalAnalysis(ModuleSummaryIndex &Index) {
 
   // Convert the ModuleSummaryIndex to a FunctionMap
   for (auto &GVS : Index) {
-    if (!GVS.second.SummaryList.size() ||
-        !isa<FunctionSummary>(GVS.second.SummaryList.front().get()))
-      continue;
-
     for (auto &GV : GVS.second.SummaryList) {
+      if (AliasSummary *AS = dyn_cast<AliasSummary>(GV.get())) {
+        if (AS->isLive())
+          Functions[GVS.first] = llvm::make_unique<SSFunctionSummary>(*AS);
+        continue;
+      }
+
       FunctionSummary *FS = dyn_cast<FunctionSummary>(GV.get());
+      if (!FS)
+        continue;
+
       if (!FS->isLive()) {
         // This function is not live, drop allocas/params so they won't be
         // serialized/deserialized
@@ -992,7 +1050,10 @@ void stackSafetyGlobalAnalysis(ModuleSummaryIndex &Index) {
   // Write the analysis results back to the module summary.
   std::vector<FunctionSummary::Alloca> NewAllocas;
   for (auto &FN : Functions) {
-    FunctionSummary *FS = FN.second->FS;
+    FunctionSummary *FS = dyn_cast<FunctionSummary>(FN.second->GVS);
+    if (!FS)
+      continue;
+
     NewAllocas.clear();
 
     // Only save sizes/ranges for allocas, we don't need to preserve parameters
