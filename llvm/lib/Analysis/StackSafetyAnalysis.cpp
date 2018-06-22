@@ -933,7 +933,8 @@ bool StackSafetyGlobalAnalysis::runOnModule(Module &M) {
       if (!F.isDeclaration())
         Functions[F.getGUID()] = std::move(SSI.run(F).Summary);
     for (auto &A : M.aliases())
-      Functions[A.getGUID()] = llvm::make_unique<SSFunctionSummary>(A);
+      if (isa<Function>(A.getBaseObject()))
+        Functions[A.getGUID()] = llvm::make_unique<SSFunctionSummary>(A);
 
     StackSafetyDataFlowAnalysis SSDFA(Functions);
     SSDFA.run();
@@ -978,9 +979,6 @@ bool StackSafetyGlobalAnalysis::runOnModule(Module &M) {
             break;
         }
       }
-
-      assert(GVS->isLive() &&
-             "Promoted/internalized/imported function must be live");
     }
 
     assert(GVS && "GlobalValueSummary for function not found");
@@ -1023,7 +1021,7 @@ void stackSafetyGlobalAnalysis(ModuleSummaryIndex &Index) {
   for (auto &GVS : Index) {
     for (auto &GV : GVS.second.SummaryList) {
       if (AliasSummary *AS = dyn_cast<AliasSummary>(GV.get())) {
-        if (AS->isLive())
+        if (AS->isLive() && isa<FunctionSummary>(AS->getBaseObject()))
           Functions[GVS.first] = llvm::make_unique<SSFunctionSummary>(*AS);
         continue;
       }
